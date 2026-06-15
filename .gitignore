@@ -1,0 +1,4 @@
+pdet/input/*.csv
+pdet/data/*.npy
+pdet/data/*.json
+
