@@ -13,13 +13,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 import io
 import json
+import sys
+import tempfile
 import requests
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+from gdc_index_code import build_gdc_index
 import ehrapy as ep
 import ehrdata as ed
 import hvplot.pandas  # enables .hvplot accessor
 import holoviews as hv
 from rapidfuzz import process as rf_process, fuzz
+
+from gdc_index_code import build_gdc_index
+
 
 pn.extension("tabulator", "bokeh")
 
@@ -317,10 +324,10 @@ proceed_btn  = pn.widgets.Button(
 )
 
 # Analysis-local state (mirrors relevant keys into shared `state`)
-astate = {"edata": None, "leiden_key": None}
+astate = {"edata": None, "leiden_key": None, "cluster_df": None}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Clean, encode, infer feature types
+# STEP 1 — Clean only; encoding happens after missingness decisions in Step 2
 # ─────────────────────────────────────────────────────────────────────────────
 def on_step1(event):
     if state.get("df") is None:
@@ -332,79 +339,28 @@ def on_step1(event):
         df = _code_safe_columns(df)
         df = _standardize_missing_values(df)
         df = df.replace({pd.NA: np.nan})
-        state["cleaned_df"] = df
 
-        # Auto-detect a patient ID column (unique values, plausible name)
+        # Detect and store patient ID column — excluded from features and field matching
         id_col = next(
             (c for c in ["cprid", "patient_id", "patientid", "id", "subject_id"]
              if c in df.columns and df[c].is_unique),
             None,
         )
-
-        step1_status.object = "*⏳ Creating AnnData object...*"
-        adata = (ed.io.from_pandas(df, index_column=id_col)
-                 if id_col else ed.io.from_pandas(df))
-        adata.layers["raw_data"] = adata.X.copy()
-
-        step1_status.object = "*⏳ Encoding categorical columns...*"
-
-        # Extract data as dataframe to identify and encode ONLY categorical object columns
-        x_df = pd.DataFrame(adata.X, columns=adata.var_names, index=adata.obs_names)
-        object_cols = x_df.select_dtypes(include=['object']).columns.tolist()
-
-        if object_cols:
-            # One-hot encode ONLY true categorical columns (strings like 'Male', 'Female')
-            # NOT numeric columns stored as strings — convert those to numeric first
-            for col in object_cols:
-                # Try to convert to numeric; if fails, it's truly categorical → one-hot encode
-                try:
-                    x_df[col] = pd.to_numeric(x_df[col], errors='raise')
-                except (ValueError, TypeError):
-                    # Keep as categorical for one-hot encoding
-                    pass
-
-            # Now one-hot encode only the remaining object columns (true categoricals)
-            remaining_object = x_df.select_dtypes(include=['object']).columns.tolist()
-            if remaining_object:
-                x_df = pd.get_dummies(x_df, columns=remaining_object, drop_first=False, dtype=float)
-
-            # Recreate adata with cleaned data
-            adata = ed.io.from_pandas(x_df, index_column=None)
-            adata.layers["raw_data"] = adata.X.copy()
-
-        # Do NOT call ed.infer_feature_types or ep.pp.encode here.
-        # infer_feature_types marks all 0/1 float dummies as "categorical", which causes
-        # ep.pp.minmax_norm in step 3 to silently filter to only "continuous" features,
-        # returning an AnnData with 0 columns. We handle normalisation with sklearn instead.
-
-        # Drop implicit-baseline dummies produced by pd.get_dummies
-        # (_no / _false are the reference level for binary Yes/No, True/False columns;
-        #  _nan indicates a missing-indicator dummy that should not be a feature).
-        baseline_suffixes = ["_nan", "_no", "_false", "_missing", "_unknown"]
-        cols_to_drop = [v for v in adata.var_names
-                       if any(v.lower().endswith(suffix) for suffix in baseline_suffixes)]
-        if cols_to_drop:
-            adata = adata[:, [v for v in adata.var_names if v not in cols_to_drop]].copy()
-
-        # Ensure adata.X is a clean float array with real NaN (no string "nan" tokens).
-        _x_san = pd.DataFrame(
-            np.asarray(adata.X, dtype=object), columns=adata.var_names
-        ).apply(pd.to_numeric, errors="coerce")
-        adata.X = _x_san.values.astype(float)
-
-        astate["edata"] = adata
-        state["edata"]  = adata
+        state["id_col"] = id_col
+        if id_col:
+            df = df.drop(columns=[id_col])
+        state["cleaned_df"] = df
 
         step1_out.objects = [
             pn.pane.HTML(
-                f"<b>✓ {len(adata.var_names)} features</b> &nbsp;·&nbsp; "
-                f"<b>{len(adata.obs_names):,} patients</b>"
+                f"<b>✓ {len(df.columns)} variables</b> &nbsp;·&nbsp; "
+                f"<b>{len(df):,} patients</b>"
                 + (f"  &nbsp;·&nbsp; <i>index: {id_col}</i>" if id_col else "")
             )
         ]
         step1_out.visible = True
         step1_status.object = "**✓ Done — review missingness below.**"
-        _build_missingness_step(adata)
+        _build_missingness_step(df)
         step2_card.visible = True
 
     except Exception as e:
@@ -415,18 +371,57 @@ def on_step1(event):
 step1_btn.on_click(on_step1)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — Missingness inspection & decision
+# STEP 2 — Missingness inspection & decision (on original columns, before encoding)
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_missingness_step(adata):
-    """Render missingness chart and variable checkboxes for selective dropping."""
-    x_frame = pd.DataFrame(
-        np.asarray(adata.X), columns=adata.var_names, index=adata.obs_names
-    )
-    # Coerce stray string "nan" / non-numeric tokens to real NaN before measuring missingness.
-    x_frame = x_frame.apply(pd.to_numeric, errors="coerce")
-    missing_pct_all = x_frame.isna().mean().sort_values(ascending=False) * 100
 
-    # Only plot / list variables that actually have missing values.
+def _create_anndata(df):
+    """One-hot encode a cleaned DataFrame and return an AnnData ready for clustering.
+    Called after the user has handled missingness on the original columns.
+    The ID column must already be dropped from df before calling this."""
+    adata = ed.io.from_pandas(df)
+    adata.layers["raw_data"] = adata.X.copy()
+
+    x_df = pd.DataFrame(adata.X, columns=adata.var_names, index=adata.obs_names)
+    object_cols = x_df.select_dtypes(include=['object']).columns.tolist()
+
+    if object_cols:
+        for col in object_cols:
+            try:
+                x_df[col] = pd.to_numeric(x_df[col], errors='raise')
+            except (ValueError, TypeError):
+                pass
+
+        remaining_object = x_df.select_dtypes(include=['object']).columns.tolist()
+        if remaining_object:
+            # Preserve NaN through get_dummies (default fills NaN rows with 0)
+            nan_masks = {col: x_df[col].isna() for col in remaining_object}
+            x_df = pd.get_dummies(x_df, columns=remaining_object, drop_first=False, dtype=float)
+            for orig_col, mask in nan_masks.items():
+                if mask.any():
+                    dummy_cols = [c for c in x_df.columns if c.startswith(orig_col + "_")]
+                    x_df.loc[mask, dummy_cols] = np.nan
+
+        adata = ed.io.from_pandas(x_df, index_column=None)
+        adata.layers["raw_data"] = adata.X.copy()
+
+    # Drop reference-level dummies (_no / _false) and missing-indicator dummies (_nan etc.)
+    baseline_suffixes = ["_nan", "_no", "_false", "_missing", "_unknown"]
+    cols_to_drop = [v for v in adata.var_names
+                   if any(v.lower().endswith(s) for s in baseline_suffixes)]
+    if cols_to_drop:
+        adata = adata[:, [v for v in adata.var_names if v not in cols_to_drop]].copy()
+
+    # Ensure adata.X is a clean float array
+    _x_san = pd.DataFrame(
+        np.asarray(adata.X, dtype=object), columns=adata.var_names
+    ).apply(pd.to_numeric, errors="coerce")
+    adata.X = _x_san.values.astype(float)
+    return adata
+
+
+def _build_missingness_step(df):
+    """Render missingness chart and checkboxes for the original (pre-encoding) columns."""
+    missing_pct_all = df.isna().mean().sort_values(ascending=False) * 100
     missing_pct = missing_pct_all[missing_pct_all > 0]
 
     if missing_pct.empty:
@@ -440,7 +435,6 @@ def _build_missingness_step(adata):
     else:
         missing_df = missing_pct.reset_index()
         missing_df.columns = ['field', 'missing_pct']
-
         plot = missing_df.hvplot.bar(
             x='field', y='missing_pct',
             title='Missingness by field (red >30%, amber >10%, blue ≤10%)',
@@ -455,7 +449,6 @@ def _build_missingness_step(adata):
                      * hv.HLine(10).opts(color="#fb8c00", line_dash="dashed")
         miss_plt.object = plot
 
-    # Build checkboxes — only variables that have missing values.
     var_checkboxes_container.clear()
     rows = []
     for var in missing_pct.index:
@@ -473,89 +466,103 @@ def _build_missingness_step(adata):
     for var, cb, row in rows:
         var_checkboxes_container.append(row)
 
-    # Store checkbox refs for later retrieval
     _build_missingness_step._checkboxes = {var: cb for var, cb, _ in rows}
 
-def _run_after_drop(drop_fields, impute):
-    """Apply field drops and optionally impute."""
-    adata = astate["edata"]
-    step2_status.object = "*⏳ Applying field exclusions...*"
-    if drop_fields:
-        keep = [v for v in adata.var_names if v not in drop_fields]
-        adata = adata[:, keep].copy()
-        astate["edata"] = adata
 
-    if impute:
-        step2_status.object = "*⏳ Running KNN imputation...*"
-        ep.pp.knn_impute(adata)
+def _invalidate_clustering():
+    """Hide and clear steps 3/4 so stale cluster results are never shown after field changes."""
+    step3_card.visible = False
+    step4_card.visible = False
+    astate["edata"] = None
+    astate["leiden_key"] = None
+    astate["cluster_df"] = None
+    proceed_btn.visible = False
+    cluster_features_container.clear()
+    umap_plt.object = None
+    leiden_plt.object = None
+    compare_plt.object = None
 
-    n_remaining = len(adata.var_names)
-    step2_status.object = (
-        f"**✓ Dropped {len(drop_fields)} fields → {n_remaining} remaining.**  "
-        f"{'Imputed.' if impute else 'No imputation.'} Proceeding to UMAP..."
-    )
-    state["edata"] = adata
-    _run_step3(adata)
 
 def on_remove(event):
-    """Drop the selected fields and refresh the missingness view (stay on step 2)."""
-    adata = astate["edata"]
+    """Drop selected original columns from cleaned_df and refresh the missingness view."""
+    df = state.get("cleaned_df")
+    if df is None:
+        return
     checkboxes = getattr(_build_missingness_step, '_checkboxes', {})
-    to_drop = [var for var, cb in checkboxes.items() if cb.value]
+    to_drop = [col for col, cb in checkboxes.items() if cb.value]
 
     if not to_drop:
         step2_status.object = "⚠️ No fields selected to remove."
         return
 
     step2_status.object = f"*⏳ Removing {len(to_drop)} fields...*"
-    keep = [v for v in adata.var_names if v not in to_drop]
-    adata = adata[:, keep].copy()
-    astate["edata"] = adata
-    state["edata"] = adata
-
+    df = df.drop(columns=to_drop)
+    state["cleaned_df"] = df
+    _invalidate_clustering()
     step2_status.object = f"**✓ Removed {len(to_drop)} fields.** Adjust remaining fields or proceed."
-    _build_missingness_step(adata)
+    _build_missingness_step(df)
     for cb in getattr(_build_missingness_step, '_checkboxes', {}).values():
         cb.value = False
 
+
 def on_impute(event):
-    """Median-impute the selected fields and refresh the missingness view (stay on step 2)."""
-    adata = astate["edata"]
+    """Impute selected original columns with median/mode and refresh the missingness view."""
+    df = state.get("cleaned_df")
+    if df is None:
+        return
     checkboxes = getattr(_build_missingness_step, '_checkboxes', {})
-    to_impute = [var for var, cb in checkboxes.items() if cb.value]
+    to_impute = [col for col, cb in checkboxes.items() if cb.value]
 
     if not to_impute:
         step2_status.object = "⚠️ No fields selected for imputation."
         return
 
     step2_status.object = f"*⏳ Imputing {len(to_impute)} selected fields...*"
-    x_frame = pd.DataFrame(
-        np.asarray(adata.X), columns=adata.var_names, index=adata.obs_names
-    ).apply(pd.to_numeric, errors="coerce")
-
+    df = df.copy()
     imputed = 0
     for col in to_impute:
-        if col in x_frame.columns and x_frame[col].isna().any():
-            x_frame[col] = x_frame[col].fillna(x_frame[col].median())
+        if col in df.columns and df[col].isna().any():
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].fillna(df[col].median())
+            else:
+                df[col] = df[col].fillna(df[col].mode()[0])
             imputed += 1
-
-    adata.X = x_frame.values.astype(float)
-    astate["edata"] = adata
-    state["edata"] = adata
-
+    state["cleaned_df"] = df
+    _invalidate_clustering()
     step2_status.object = f"**✓ Imputed {imputed} fields.** Adjust remaining fields or proceed."
-    _build_missingness_step(adata)
+    _build_missingness_step(df)
     for cb in getattr(_build_missingness_step, '_checkboxes', {}).values():
         cb.value = False
 
+
 def on_continue(event):
-    """Proceed to UMAP with the current data (no further changes)."""
-    adata = astate.get("edata")
-    if adata is None:
+    """Encode the cleaned df then proceed to UMAP."""
+    df = state.get("cleaned_df")
+    if df is None:
         step2_status.object = "❌ No data available — run Step 1 first."
         return
-    step2_status.object = "*⏳ Proceeding to UMAP...*"
-    _run_step3(adata)
+
+    # Block if any missing values remain — user must remove or impute all of them.
+    n_missing_cols = df.isna().any().sum()
+    if n_missing_cols > 0:
+        missing_names = ", ".join(df.columns[df.isna().any()].tolist())
+        step2_status.object = (
+            f"❌ **{n_missing_cols} column(s) still have missing values:** {missing_names}. "
+            "Please remove or impute them before continuing."
+        )
+        return
+
+    step2_status.object = "*⏳ Encoding categorical variables for clustering...*"
+    try:
+        adata = _create_anndata(df)
+        astate["edata"] = adata
+        state["edata"]  = adata
+        astate["cluster_df"] = df.copy()
+        step2_status.object = "*⏳ Proceeding to UMAP...*"
+        _run_step3(adata, df)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        step2_status.object = f"❌ Encoding failed: `{e}`"
 
 remove_btn.on_click(on_remove)
 impute_btn.on_click(on_impute)
@@ -564,19 +571,18 @@ continue_btn.on_click(on_continue)
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — Normalise → neighbours → UMAP
 # ─────────────────────────────────────────────────────────────────────────────
-def _run_step3(adata):
+def _run_step3(adata, cleaned_df):
     from sklearn.preprocessing import MinMaxScaler
 
     step3_card.visible  = True
     step3_status.object = "*⏳ Normalising (min-max)...*"
     try:
-        # Use sklearn directly — ep.pp.minmax_norm filters by ehrapy feature-type metadata
-        # and returns 0 features when all columns were classified as "categorical".
         x_np = np.asarray(adata.X, dtype=float)
 
-        # Fill any remaining NaN with column median before scaling
         if np.isnan(x_np).any():
-            step3_status.object = "*⏳ Imputing remaining missing values (median)...*"
+            # This should not happen if on_continue blocked incomplete data,
+            # but NaN can appear in one-hot dummies (NaN-preserved from get_dummies).
+            # Only impute the dummy columns — the user already handled original columns.
             col_medians = np.nanmedian(x_np, axis=0)
             nan_idx = np.where(np.isnan(x_np))
             x_np[nan_idx] = col_medians[nan_idx[1]]
@@ -625,7 +631,7 @@ def _run_step3(adata):
 
         step3_status.object = "**✓ UMAP ready — adjust clusters below.**"
         step4_card.visible  = True
-        _run_leiden(adata, res_slider.value)
+        _run_leiden(adata, cleaned_df, res_slider.value)
 
     except Exception as e:
         import traceback
@@ -635,13 +641,14 @@ def _run_step3(adata):
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_cluster_comparison(adata, leiden_key):
+def _build_cluster_comparison(adata, leiden_key, cleaned_df):
     """
     Build per-cluster defining-feature cards from cleaned_df (original column names).
+    cleaned_df is passed explicitly (not read from state) to guarantee it matches
+    the adata that was used for clustering.
     Deviation data is stored in astate for the checkbox-driven comparison chart,
     which renders below the cards so ticking a variable doesn't snap the viewport.
     """
-    cleaned_df = state.get("cleaned_df")
     cluster_features_container.clear()
     _build_cluster_comparison._cluster_checkboxes = {}
     compare_plt.object = None  # blank until user ticks features
@@ -797,7 +804,7 @@ def _refresh_compare_plot():
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — Leiden clustering + cluster comparison
 # ─────────────────────────────────────────────────────────────────────────────
-def _run_leiden(adata, resolution):
+def _run_leiden(adata, cleaned_df, resolution):
     key = f"leiden_r{resolution:.1f}".replace(".", "_")
     step4_status.object = f"*⏳ Running Leiden (resolution={resolution:.1f})...*"
     if key not in adata.obs.columns:
@@ -824,7 +831,7 @@ def _run_leiden(adata, resolution):
     leiden_plt.object = plot_leiden
 
     step4_status.object = "*⏳ Building cluster comparison...*"
-    _build_cluster_comparison(adata, key)
+    _build_cluster_comparison(adata, key, cleaned_df)
 
     step4_status.object = (
         f"**✓ {n} clusters at resolution {resolution:.1f}.** "
@@ -833,8 +840,8 @@ def _run_leiden(adata, resolution):
     proceed_btn.visible = True
 
 def on_update_leiden(event):
-    if astate.get("edata") is not None:
-        _run_leiden(astate["edata"], res_slider.value)
+    if astate.get("edata") is not None and astate.get("cluster_df") is not None:
+        _run_leiden(astate["edata"], astate["cluster_df"], res_slider.value)
 
 update_btn.on_click(on_update_leiden)
 
@@ -933,10 +940,13 @@ step4_card = analysis_tab[4]
 # FIELD MATCHING  — backend helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-_BASE = Path(__file__).parent / "data" / "epi700"
-_INDEX_PATH    = _BASE / "gdc_field_index.json"
-_EMB_PATH      = _BASE / "gdc_field_embeddings.npy"
-_EMB_KEYS_PATH = _BASE / "gdc_field_embedding_keys.json"
+_CACHE_DIR     = Path(tempfile.gettempdir()) / "pdet_gdc_cache"
+_CLONE_DIR     = _CACHE_DIR / "gdcdictionary"
+_SCHEMAS_DIR   = _CLONE_DIR / "src/gdcdictionary/schemas"
+_DATA_DIR      = Path(__file__).parent / "data"
+_INDEX_PATH    = _DATA_DIR / "gdc_field_index.json"
+_EMB_PATH      = _DATA_DIR / "gdc_field_embeddings.npy"
+_EMB_KEYS_PATH = _DATA_DIR / "gdc_field_embedding_keys.json"
 
 # Lazy-loaded singletons — populated on first call to _ensure_model()
 _gdc_index        = None
@@ -1008,10 +1018,15 @@ _GENE_SUFFIXES = ("_status", "_mut", "_mutation", "_variant", "_snp", "_alterati
 
 def _ensure_model(status_cb=None):
     """Lazily load GDC index, embeddings, sentence model, and scispacy NER."""
+
     global _gdc_index, _clinical_index, _gdc_keys, _embeddings, _model, _gdc_corpus_dict, _sci_nlp
     if _model is not None:
         return True
     try:
+        if not _INDEX_PATH.exists():
+            if status_cb:
+                status_cb("*⏳ Building GDC field index from repository (first run — ~30 s)…*")
+            build_gdc_index(clone_dir=_CLONE_DIR, schemas_dir=_SCHEMAS_DIR, output_path=_INDEX_PATH)
         if status_cb:
             status_cb("*⏳ Loading GDC field index…*")
         with open(_INDEX_PATH) as f:
@@ -1464,35 +1479,40 @@ def _on_run_matching(event):
     if not ok:
         return
 
-    _fm_status.object = "*⏳ Matching columns to GDC fields…*"
-    mr  = _match_all(df)
-    ef  = _compile_export_fields(mr)
-    vm  = _map_values(df, mr)
-    _apply_manual_overrides(mr, vm)
+    try:
+        _fm_status.object = "*⏳ Matching columns to GDC fields…*"
+        mr  = _match_all(df)
+        ef  = _compile_export_fields(mr)
+        vm  = _map_values(df, mr)
+        _apply_manual_overrides(mr, vm)
 
-    state["mapping_results"] = mr
-    state["export_fields"]   = ef
-    state["value_mappings"]  = vm
+        state["mapping_results"] = mr
+        state["export_fields"]   = ef
+        state["value_mappings"]  = vm
 
-    auto      = sum(1 for r in mr.values() if r["status"] == "auto")
-    review    = sum(1 for r in mr.values() if r["status"] == "review")
-    unmatched = sum(1 for r in mr.values() if r["status"] == "unmatched")
-    genomic   = sum(1 for r in mr.values() if r.get("query_type") == "genomic")
+        auto      = sum(1 for r in mr.values() if r["status"] == "auto")
+        review    = sum(1 for r in mr.values() if r["status"] == "review")
+        unmatched = sum(1 for r in mr.values() if r["status"] == "unmatched")
+        genomic   = sum(1 for r in mr.values() if r.get("query_type") == "genomic")
 
-    _fm_summary.objects = [
-        _stat_card("✅", "Auto-matched", auto,      "#f0fff4"),
-        _stat_card("⚠️", "Needs review", review,    "#fffbf0"),
-        _stat_card("❌", "Unmatched",    unmatched, "#fff5f5"),
-        _stat_card("🧬", "Genomic",      genomic,   "#f0f7ff"),
-    ]
-    _fm_summary.visible = True
-    _fm_results.objects = [_build_fm_table(mr)]
-    _fm_results.visible = True
-    _fm_status.object   = (
-        f"**Matching complete** — {len(mr)} columns processed. "
-        "Review ⚠️ rows and correct any wrong GDC fields, then confirm."
-    )
-    _fm_confirm.visible = True
+        _fm_summary.objects = [
+            _stat_card("✅", "Auto-matched", auto,      "#f0fff4"),
+            _stat_card("⚠️", "Needs review", review,    "#fffbf0"),
+            _stat_card("❌", "Unmatched",    unmatched, "#fff5f5"),
+            _stat_card("🧬", "Genomic",      genomic,   "#f0f7ff"),
+        ]
+        _fm_summary.visible = True
+        _fm_results.objects = [_build_fm_table(mr)]
+        _fm_results.visible = True
+        _fm_status.object   = (
+            f"**Matching complete** — {len(mr)} columns processed. "
+            "Review ⚠️ rows and correct any wrong GDC fields, then confirm."
+        )
+        _fm_confirm.visible = True
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _fm_status.object = f"❌ Field matching failed: `{e}`"
 
 _fm_run_btn.on_click(_on_run_matching)
 
@@ -1547,11 +1567,13 @@ DEFAULT_EXPORT_FIELDS = [
 ]
 
 def _ensure_index():
-    """Load just the GDC index JSON (fast — no model)."""
+    """Load the GDC index, building it from the live repo if not yet cached."""
     global _gdc_index
     if _gdc_index is not None:
         return True
     try:
+        if not _INDEX_PATH.exists():
+            build_gdc_index(clone_dir=_CLONE_DIR, schemas_dir=_SCHEMAS_DIR, output_path=_INDEX_PATH)
         with open(_INDEX_PATH) as f:
             _gdc_index = json.load(f)
         return True
@@ -1794,7 +1816,7 @@ _qb_export_choice = pn.widgets.MultiChoice(
 )
 _qb_fields_status = pn.pane.Markdown(
     f"*{len(_qb_all_paths)} GDC fields available.*" if _qb_all_paths
-    else "⚠️ Could not load GDC field index — check that `data/epi700/gdc_field_index.json` exists."
+    else "⚠️ GDC field index not yet built — it will be downloaded automatically when Field Matching runs."
 )
 
 # ── Per-cluster filter cards ──────────────────────────────────────────────────
