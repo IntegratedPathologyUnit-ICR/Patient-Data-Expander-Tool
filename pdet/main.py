@@ -2207,5 +2207,9 @@ tabs
 # Serve the app
 # ──────────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
+    """Entry point for the `pdet` terminal command."""
     pn.serve(tabs, port=5006, show=True)
+
+if __name__ == "__main__":
+    main()

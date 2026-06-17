@@ -3,6 +3,9 @@ pyproject.toml
 patient_data_expander_tool.egg-info/PKG-INFO
 patient_data_expander_tool.egg-info/SOURCES.txt
 patient_data_expander_tool.egg-info/dependency_links.txt
+patient_data_expander_tool.egg-info/entry_points.txt
 patient_data_expander_tool.egg-info/requires.txt
 patient_data_expander_tool.egg-info/top_level.txt
+pdet/__init__.py
+pdet/gdc_index_code.py
 pdet/main.py
