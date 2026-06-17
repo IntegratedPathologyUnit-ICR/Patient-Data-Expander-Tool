@@ -21,4 +21,4 @@ dependencies = [
 ]
 
 [project.scripts]
-pdet = "pdet.main:main"
+run_pdet = "pdet.main:main"
