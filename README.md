@@ -1,4 +1,4 @@
-![PyPI - Version](https://img.shields.io/pypi/v/patient-data-expander-tool)
+![PyPI - Version](https://img.shields.io/pypi/v/pdet)
 
 # Usage
 
@@ -7,7 +7,7 @@
 You can install the **Patient Data Expander Tool** directly from PyPI using `pip`:
 
 ```bash
-pip install patient-data-expander-tool
+pip install pdet
 ```
 
 ## How to run
