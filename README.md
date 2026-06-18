@@ -1,4 +1,4 @@
-![PyPI - Version](https://img.shields.io/pypi/v/pdet)
+[![PyPI Version](https://img.shields.io/pypi/v/pdet)](https://pypi.org/project/pdet/)
 
 # Usage
 
