@@ -2,6 +2,20 @@
 
 # Usage
 
+## install
+
+install uv
+
+clone/download repo
+
+uv sync
+
+## Run
+
+uv run python -m pdet
+
+
+
 ## Installation
 
 You can install the **Patient Data Expander Tool** directly from PyPI using `pip`:

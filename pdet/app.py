@@ -2207,9 +2207,10 @@ tabs
 # Serve the app
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main():
+def serve_pdet_app():
     """Entry point for the `pdet` terminal command."""
     pn.serve(tabs, port=5006, show=True)
 
+# Below has been deprecated
 if __name__ == "__main__":
-    main()
+    serve_pdet_app()
