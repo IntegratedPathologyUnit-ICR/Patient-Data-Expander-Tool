@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "The Patient Data Expander Tool allows researchers to identify clusters within their patient data sets, select the features that best define those clusters, then query public databases for similar patients and export their data to expand their initial dataset."
 readme = "README.md"
 authors = [
-  {name = "Joseph Cottrell", email="josephcottrell99@gmail.com"}
+  {name = "Joseph Cottrell", email="josephcottrell99@gmail.com"},
   {name = "Ferran", email = "fercr@tuta.io"}
 ]
 license = {text = "Apache-2.0"}
