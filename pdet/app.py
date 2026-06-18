@@ -79,7 +79,22 @@ header_status_md = pn.pane.Markdown("")
 _header_inputs: dict[str, pn.widgets.TextInput] = {}   # current_col → TextInput
 
 def _build_header_editor(df):
-    """(Re)build one editable row per column, pre-filled with its current name."""
+    """(Re)build one editable row per column, pre-filled with its current name.
+    
+    Clear the existing editor state and populate the Panel layout with 
+    text input fields for renaming columns.
+
+    Parameters
+    ----------
+    df (pd.DataFrame): The DataFrame containing the target columns to edit.
+
+    Side Effects
+    ------------
+    - Clears and populates `header_edit_container` with the new UI rows.
+    - Resets and populates the `_header_inputs` dictionary with new 
+        `pn.widgets.TextInput` objects, keyed by original column name.
+    - Sets the visibility of `header_apply_btn` to True.
+    """
     header_edit_container.clear()
     _header_inputs.clear()
     rows = []
@@ -98,6 +113,18 @@ def _build_header_editor(df):
     header_apply_btn.visible = True
 
 def on_apply_headers(event):
+    """Apply edited header names to the active DataFrame.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event that triggered the header update.
+
+    Side Effects
+    ------------
+    Updates ``state['df']``, refreshes the preview table, updates the
+    metadata/status text, and rebuilds the header editor.
+    """
     df = state.get("df")
     if df is None or not _header_inputs:
         return
@@ -123,6 +150,19 @@ def on_apply_headers(event):
 header_apply_btn.on_click(on_apply_headers)
 
 def on_upload(event):
+    """Load the selected CSV/TSV file into the application state.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The filename-change event emitted by the file input widget.
+
+    Side Effects
+    ------------
+    Reads the uploaded file into a DataFrame, updates the preview and
+    metadata widgets, enables analysis navigation, and rebuilds the
+    header editor.
+    """
     if not event.new:
         return
     if file_input.value is None:
@@ -189,7 +229,22 @@ upload_tab = pn.Column(
 # ── Generic data-cleaning helpers ─────────────────────────────────────────────
 
 def _code_safe_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    """Lowercase, spaces/specials → underscores, strip leading/trailing underscores."""
+    """Sanitize DataFrame column names to be code-safe.
+    
+    Converts column names to lowercase, replaces spaces and special characters
+    with underscores, collapses consecutive underscores, and strips leading/trailing
+    underscores.
+    
+    Parameters
+    ----------
+    frame : pd.DataFrame
+        Input DataFrame with column names to sanitize.
+    
+    Returns
+    -------
+    pd.DataFrame
+        A copy of the input DataFrame with sanitized column names.
+    """
     safe = frame.copy()
     safe.columns = (
         safe.columns.astype(str)
@@ -202,11 +257,30 @@ def _code_safe_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return safe
 
 def _missing_value_tokens() -> set[str]:
+    """Return the set of common missing-value string representations.
+    
+    Returns
+    -------
+    set[str]
+        Standardized missing value tokens such as empty strings, "na", "n/a",
+        "nan", "unknown", and variations thereof.
+    """
     return {"", "na", "n/a", "nan", "unknown", "fail / unknown",
             "equivocal / unknown", "equivicol / unknown"}
 
 def _standardize_missing_values(frame: pd.DataFrame) -> pd.DataFrame:
-    """Replace common missing-value strings with NaN across all columns."""
+    """Replace common missing-value strings with NaN across all columns.
+    
+    Parameters
+    ----------
+    frame : pd.DataFrame
+        Input DataFrame to standardize.
+    
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the input DataFrame with missing-value tokens replaced by NaN.
+    """
     cleaned = frame.copy()
     tokens  = _missing_value_tokens()
     for col in cleaned.columns:
@@ -219,10 +293,27 @@ def _standardize_missing_values(frame: pd.DataFrame) -> pd.DataFrame:
 # ── Cluster profiler (called after Leiden + Field Matching are complete) ───────
 
 def profile_all_clusters(cleaned_df, edata, mapping_results, leiden_key):
-    """
-    For every Leiden cluster compute the dominant value and prevalence of each
-    matched column. Returns a dict keyed by cluster ID string.
-    Skips unmatched columns and high-cardinality continuous ones.
+    """Compute dominant values and prevalence for each Leiden cluster.
+    
+    For every Leiden cluster, compute the dominant value and prevalence of each
+    matched column. Skips unmatched columns and high-cardinality continuous ones.
+    
+    Parameters
+    ----------
+    cleaned_df : pd.DataFrame
+        Cleaned input DataFrame containing patient data.
+    edata : object
+        Expression data object containing cluster assignments in obs.
+    mapping_results : dict
+        Mapping results keyed by column name with field matching information.
+    leiden_key : str
+        Key in edata.obs containing Leiden cluster assignments.
+    
+    Returns
+    -------
+    dict
+        Cluster profiles keyed by cluster ID string, each containing n_patients
+        and features dict with dominant values and prevalence information.
     """
     labelled = cleaned_df.copy()
     labelled["_cluster"] = edata.obs[leiden_key].values
@@ -272,6 +363,23 @@ def profile_all_clusters(cleaned_df, edata, mapping_results, leiden_key):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _step_header(n, title, subtitle=""):
+    """
+    Create an HTML pane representing a numbered step header for the UI.
+
+    Parameters
+    ----------
+    n : int
+        Step number to display inside the circular badge.
+    title : str
+        Title text for the step.
+    subtitle : str, optional
+        Optional subtitle or explanatory text displayed beneath the title.
+
+    Returns
+    -------
+    pn.pane.HTML
+        A Panel HTML pane containing the styled step header.
+    """
     return pn.pane.HTML(
         f"<div style='display:flex;align-items:center;gap:12px;margin:16px 0 6px'>"
         f"<div style='background:#1a73e8;color:#fff;border-radius:50%;width:30px;height:30px;"
@@ -282,6 +390,21 @@ def _step_header(n, title, subtitle=""):
     )
 
 def _card(*contents, **kwargs):
+    """
+    Build a styled Panel Column used as a card container.
+
+    Parameters
+    ----------
+    *contents
+        Child components to include inside the card (Panel objects).
+    **kwargs
+        Additional keyword arguments forwarded to pn.Column.
+
+    Returns
+    -------
+    pn.Column
+        A Panel Column configured with border, padding and background styles.
+    """
     return pn.Column(
         *contents,
         styles={"border": "1px solid #e0e0e0", "border-radius": "8px",
