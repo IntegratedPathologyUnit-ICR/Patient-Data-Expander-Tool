@@ -1,3 +1,5 @@
+![PyPI - Version](https://img.shields.io/pypi/v/patient-data-expander-tool)
+
 ## Installation
 
 You can install the **Patient Data Expander Tool** directly from PyPI using `pip`:
