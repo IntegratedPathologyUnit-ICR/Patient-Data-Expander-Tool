@@ -192,6 +192,7 @@ def on_upload(event):
 file_input.param.watch(on_upload, "filename")
 
 def on_goto_analysis(event):
+    """Switch the tab panel to the Analysis tab."""
     tabs.active = 1   # Analysis is tab index 1
 
 goto_analysis_btn.on_click(on_goto_analysis)
@@ -453,6 +454,18 @@ astate = {"edata": None, "leiden_key": None, "cluster_df": None}
 # STEP 1 — Clean only; encoding happens after missingness decisions in Step 2
 # ─────────────────────────────────────────────────────────────────────────────
 def on_step1(event):
+    """Run Step 1: standardise column names and missing values.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+
+    Side Effects
+    ------------
+    Updates ``state['cleaned_df']`` and ``state['id_col']``, drops the
+    detected patient-ID column, and triggers the missingness review step.
+    """
     if state.get("df") is None:
         step1_status.object = "❌ Upload a CSV on the Upload tab first."
         return
@@ -499,8 +512,21 @@ step1_btn.on_click(on_step1)
 
 def _create_anndata(df):
     """One-hot encode a cleaned DataFrame and return an AnnData ready for clustering.
-    Called after the user has handled missingness on the original columns.
-    The ID column must already be dropped from df before calling this."""
+
+    Call this after the user has handled missingness on the original columns.
+    The ID column must already be dropped from ``df`` before calling.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Cleaned DataFrame with no patient-ID column and all missingness resolved.
+
+    Returns
+    -------
+    AnnData
+        Encoded AnnData with a ``raw_data`` layer and a clean float ``X`` matrix.
+        Reference-level dummies and missing-indicator columns are removed.
+    """
     adata = ed.io.from_pandas(df)
     adata.layers["raw_data"] = adata.X.copy()
 
@@ -543,7 +569,19 @@ def _create_anndata(df):
 
 
 def _build_missingness_step(df):
-    """Render missingness chart and checkboxes for the original (pre-encoding) columns."""
+    """Render a missingness bar chart and per-column checkboxes for the original columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Current cleaned DataFrame to inspect for missing values.
+
+    Side Effects
+    ------------
+    Updates ``miss_plt`` with a colour-coded bar chart and populates
+    ``var_checkboxes_container`` with one checkbox row per missing column.
+    Stores the checkbox dict in ``_build_missingness_step._checkboxes``.
+    """
     missing_pct_all = df.isna().mean().sort_values(ascending=False) * 100
     missing_pct = missing_pct_all[missing_pct_all > 0]
 
@@ -607,7 +645,18 @@ def _invalidate_clustering():
 
 
 def on_remove(event):
-    """Drop selected original columns from cleaned_df and refresh the missingness view."""
+    """Drop selected columns from ``state['cleaned_df']`` and refresh the missingness view.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+
+    Side Effects
+    ------------
+    Removes checked columns from ``state['cleaned_df']``, invalidates any
+    existing clustering results, and rebuilds the missingness UI.
+    """
     df = state.get("cleaned_df")
     if df is None:
         return
@@ -629,7 +678,18 @@ def on_remove(event):
 
 
 def on_impute(event):
-    """Impute selected original columns with median/mode and refresh the missingness view."""
+    """Impute selected columns with median (numeric) or mode (categorical) and refresh.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+
+    Side Effects
+    ------------
+    Fills missing values in checked columns within ``state['cleaned_df']``,
+    invalidates any existing clustering results, and rebuilds the missingness UI.
+    """
     df = state.get("cleaned_df")
     if df is None:
         return
@@ -659,7 +719,19 @@ def on_impute(event):
 
 
 def on_continue(event):
-    """Encode the cleaned df then proceed to UMAP."""
+    """Encode the cleaned DataFrame and proceed to UMAP computation.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+
+    Side Effects
+    ------------
+    Blocks if any columns still contain missing values. On success, one-hot
+    encodes via ``_create_anndata``, stores the result in ``astate`` and
+    ``state``, then calls ``_run_step3``.
+    """
     df = state.get("cleaned_df")
     if df is None:
         step2_status.object = "❌ No data available — run Step 1 first."
@@ -695,6 +767,23 @@ continue_btn.on_click(on_continue)
 # STEP 3 — Normalise → neighbours → UMAP
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_step3(adata, cleaned_df):
+    """Normalise, build a neighbour graph, compute UMAP, and proceed to Leiden clustering.
+
+    Runs min-max normalisation → optional PCA for balanced feature weighting →
+    neighbour graph → UMAP embedding, then calls ``_run_leiden``.
+
+    Parameters
+    ----------
+    adata : AnnData
+        One-hot-encoded AnnData produced by ``_create_anndata``.
+    cleaned_df : pd.DataFrame
+        Original cleaned DataFrame (pre-encoding) passed through for cluster profiling.
+
+    Side Effects
+    ------------
+    Mutates ``adata.X`` in place with normalised values, updates ``astate`` and
+    ``state``, sets ``umap_plt``, makes step 4 visible, and calls ``_run_leiden``.
+    """
     from sklearn.preprocessing import MinMaxScaler
 
     step3_card.visible  = True
@@ -928,6 +1017,22 @@ def _refresh_compare_plot():
 # STEP 4 — Leiden clustering + cluster comparison
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_leiden(adata, cleaned_df, resolution):
+    """Run Leiden clustering at the given resolution and update the cluster UI.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData with a computed UMAP embedding in ``obsm['X_umap']``.
+    cleaned_df : pd.DataFrame
+        Original cleaned DataFrame used to build the per-cluster feature cards.
+    resolution : float
+        Leiden resolution parameter — higher values produce more clusters.
+
+    Side Effects
+    ------------
+    Adds the cluster key to ``adata.obs``, updates ``leiden_plt``, rebuilds
+    the cluster comparison cards, and makes ``proceed_btn`` visible.
+    """
     key = f"leiden_r{resolution:.1f}".replace(".", "_")
     step4_status.object = f"*⏳ Running Leiden (resolution={resolution:.1f})...*"
     if key not in adata.obs.columns:
@@ -963,12 +1068,31 @@ def _run_leiden(adata, cleaned_df, resolution):
     proceed_btn.visible = True
 
 def on_update_leiden(event):
+    """Re-run Leiden clustering at the current slider resolution.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+    """
     if astate.get("edata") is not None and astate.get("cluster_df") is not None:
         _run_leiden(astate["edata"], astate["cluster_df"], res_slider.value)
 
 update_btn.on_click(on_update_leiden)
 
 def on_proceed(event):
+    """Save the selected cluster-defining features and navigate to Field Matching.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+
+    Side Effects
+    ------------
+    Validates that each cluster has at most 5 selected features, stores the
+    selection in ``state['cluster_defining_features']``, and sets the active tab.
+    """
     cluster_cbs = getattr(_build_cluster_comparison, "_cluster_checkboxes", {})
     if not cluster_cbs:
         step4_status.object = "⚠️ No cluster data — run clustering first."
@@ -1279,17 +1403,32 @@ def _stage3_semantic_multi(queries: list[str], top_n: int = 10) -> list[dict]:
             for i in idx]
 
 def _norm(col):
+    """Lowercase and underscore-normalise a column name for matching."""
     return col.lower().replace("-", "_").replace(" ", "_").strip()
 
 def _to_api_path(index_path):
+    """Convert a GDC index path (entity.field) to a GDC API path (entity_plural.field)."""
     entity, _, field = index_path.partition(".")
     prefix = ENTITY_TO_API_PREFIX.get(entity, entity)
     return f"{prefix}.{field}" if field else prefix
 
 def _expand(col):
+    """Expand a column name using the abbreviation table; return it unchanged if not found."""
     return ABBREV_TABLE.get(_norm(col), col)
 
 def _detect_gene(col):
+    """Return gene metadata if the column name matches a known oncogene, else None.
+
+    Parameters
+    ----------
+    col : str
+        Column name to test (e.g. ``"kras_status"``, ``"BRAF"``).
+
+    Returns
+    -------
+    dict or None
+        ``{"gene_symbol": str, "ensembl_id": str}`` if matched, else ``None``.
+    """
     norm = _norm(col).upper()
     for suf in _GENE_SUFFIXES:
         if norm.endswith(suf.upper()):
@@ -1301,9 +1440,23 @@ def _detect_gene(col):
     return None
 
 def _cosine(a, b):
+    """Return cosine similarity between two numpy vectors, guarded against zero-norm."""
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 def _stage1_exact(col):
+    """Attempt an exact match of a normalised column name against the GDC clinical index.
+
+    Parameters
+    ----------
+    col : str
+        Column name to match.
+
+    Returns
+    -------
+    dict or None
+        Match dict with ``gdc_field``, ``index_path``, ``score``, and ``stage``,
+        or ``None`` if no exact match is found.
+    """
     norm = _norm(col)
     for ip, meta in _clinical_index.items():
         if norm == meta["field"] or norm == ip:
@@ -1312,6 +1465,21 @@ def _stage1_exact(col):
     return None
 
 def _stage2_fuzzy(col, top_n=10):
+    """Return the top fuzzy matches for a column name against the GDC corpus.
+
+    Parameters
+    ----------
+    col : str
+        Column name to match.
+    top_n : int, optional
+        Maximum number of candidates to return (default 10).
+
+    Returns
+    -------
+    list[dict]
+        Candidate dicts with ``gdc_field``, ``index_path``, ``score`` (0-1), and
+        ``stage="fuzzy"``, sorted descending by score.  Empty list for short tokens.
+    """
     norm = _norm(col)
     if len(norm) <= 5:
         return []
@@ -1321,6 +1489,21 @@ def _stage2_fuzzy(col, top_n=10):
             for _, sc, ip in results]
 
 def _stage3_semantic(col, top_n=5):
+    """Return the top semantic matches for a column name using the sentence-transformer model.
+
+    Parameters
+    ----------
+    col : str
+        Query string to embed and compare against the pre-computed corpus embeddings.
+    top_n : int, optional
+        Maximum number of candidates to return (default 5).
+
+    Returns
+    -------
+    list[dict]
+        Candidate dicts with ``gdc_field``, ``index_path``, ``score``, and
+        ``stage="semantic"``, sorted descending by cosine similarity.
+    """
     qemb = _model.encode([col], convert_to_numpy=True)[0]
     sims = [_cosine(qemb, e) for e in _embeddings]
     idx  = np.argsort(sims)[::-1][:top_n]
@@ -1329,6 +1512,25 @@ def _stage3_semantic(col, top_n=5):
             for i in idx]
 
 def _match_column(col):
+    """Match a single column name to a GDC field via a three-stage pipeline.
+
+    Stages: (1) exact name match, (2) fuzzy string matching, (3) semantic
+    embedding similarity.  Gene columns are identified first and returned
+    immediately as genomic matches.  Fuzzy and semantic results are merged by
+    taking the best score per GDC field; auto-match requires both stages to agree.
+
+    Parameters
+    ----------
+    col : str
+        Column name to match.
+
+    Returns
+    -------
+    dict
+        Result with keys ``gdc_field``, ``index_path``, ``score``, ``stage``,
+        ``status`` (``"auto"`` / ``"review"`` / ``"unmatched"``), ``column``,
+        ``expanded``, ``query_type``, and ``candidates``.
+    """
     gene = _detect_gene(col)
     if gene:
         return {"gdc_field": None, "index_path": None, "score": 1.0, "stage": "genomic",
@@ -1396,13 +1598,55 @@ def _match_column(col):
             "query_type": "clinical", "candidates": candidates[:10]}
 
 def _match_all(df):
+    """Match every column in ``df`` to a GDC field and return the full result mapping.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame whose columns are to be matched.
+
+    Returns
+    -------
+    dict[str, dict]
+        Column name → match result dict as returned by ``_match_column``.
+    """
     return {col: _match_column(col) for col in df.columns}
 
 def _compile_export_fields(mapping_results):
+    """Return a ``{column: gdc_field}`` dict for auto- and review-matched columns only.
+
+    Parameters
+    ----------
+    mapping_results : dict
+        Output of ``_match_all``.
+
+    Returns
+    -------
+    dict[str, str]
+        Column name → GDC API field path for columns with status ``"auto"`` or ``"review"``.
+    """
     return {col: r["gdc_field"] for col, r in mapping_results.items()
             if r.get("gdc_field") and r.get("status") in ("auto", "review")}
 
 def _map_values(df, mapping_results):
+    """Map each user data value to its canonical GDC enum value using fuzzy matching.
+
+    For each matched column, compare the user's observed values against the GDC
+    field's ``enum_values`` using exact, case-insensitive, then fuzzy (≥85 %) matching.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Cleaned input DataFrame.
+    mapping_results : dict
+        Output of ``_match_all``.
+
+    Returns
+    -------
+    dict
+        Per-column value-mapping dicts keyed by column name, each containing
+        ``gdc_field``, ``index_path``, ``value_map``, and ``needs_review``.
+    """
     value_mappings = {}
     for col, result in mapping_results.items():
         gf = result.get("gdc_field")
@@ -1503,6 +1747,24 @@ _fm_confirm    = pn.widgets.Button(name="Confirm & proceed to Query Builder →"
 _fm_overrides  = {}   # col → Select widget; read on confirm
 
 def _stat_card(emoji, label, count, bg):
+    """Return a styled HTML pane for a summary statistic badge.
+
+    Parameters
+    ----------
+    emoji : str
+        Emoji icon displayed at the top of the card.
+    label : str
+        Descriptive label shown below the count.
+    count : int
+        Numeric value to highlight.
+    bg : str
+        CSS background colour (e.g. ``"#f0fff4"``).
+
+    Returns
+    -------
+    pn.pane.HTML
+        Styled Panel HTML pane.
+    """
     return pn.pane.HTML(
         f"<div style='background:{bg};border-radius:8px;padding:12px 20px;"
         f"text-align:center;min-width:110px'>"
@@ -1512,6 +1774,21 @@ def _stat_card(emoji, label, count, bg):
     )
 
 def _build_fm_table(mapping_results):
+    """Build the field-matching results table as a Panel Column of styled rows.
+
+    Review rows (status ``"review"``) include a Select dropdown populated with
+    the top candidate GDC fields so the user can correct wrong matches.
+
+    Parameters
+    ----------
+    mapping_results : dict
+        Output of ``_match_all``.
+
+    Returns
+    -------
+    pn.Column
+        Styled table widget with one row per column in ``mapping_results``.
+    """
     header = pn.Row(
         pn.pane.HTML("<b>Status</b>",    width=60,  styles={"color": "#555"}),
         pn.pane.HTML("<b>Column</b>",    width=185, styles={"color": "#555"}),
@@ -1589,6 +1866,17 @@ def _build_fm_table(mapping_results):
     )
 
 def _on_run_matching(event):
+    """Run the full field-matching pipeline and populate the results table.
+
+    Loads the sentence model if needed, matches all columns, maps values to
+    GDC enums, applies hard-coded manual overrides, and stores results in
+    ``state``.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+    """
     df = state.get("cleaned_df")
     if df is None:
         df = state.get("df")
@@ -1640,6 +1928,18 @@ def _on_run_matching(event):
 _fm_run_btn.on_click(_on_run_matching)
 
 def _on_confirm(event):
+    """Apply user field-override selections and navigate to the Query Builder tab.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+
+    Side Effects
+    ------------
+    Writes the user's dropdown choices back into ``state['mapping_results']``
+    and sets the active tab to Query Builder.
+    """
     for col, sel in _fm_overrides.items():
         if col in state.get("mapping_results", {}):
             gdc_field, index_path = sel.value
@@ -1717,6 +2017,22 @@ def _all_gdc_api_paths():
     return sorted(paths)
 
 def _map_val_qb(col, raw_val, value_mappings):
+    """Translate a user data value to its canonical GDC enum value for a query.
+
+    Parameters
+    ----------
+    col : str
+        Column name.
+    raw_val : object
+        User-supplied value to translate.
+    value_mappings : dict
+        Output of ``_map_values``.
+
+    Returns
+    -------
+    str
+        Canonical GDC value if found in the value map, else ``str(raw_val)``.
+    """
     vm    = (value_mappings or {}).get(col, {}).get("value_map", {})
     entry = vm.get(str(raw_val))
     if entry and entry.get("gdc_value"):
@@ -1724,6 +2040,20 @@ def _map_val_qb(col, raw_val, value_mappings):
     return str(raw_val)
 
 def _build_clinical_filter_qb(conditions):
+    """Build a GDC API filter object from a list of clinical conditions.
+
+    Parameters
+    ----------
+    conditions : list[dict]
+        Each dict contains a ``field`` key and either ``op="range"`` with
+        optional ``min``/``max`` keys, or ``op="in"`` with a ``values`` list.
+
+    Returns
+    -------
+    dict or None
+        A GDC-compatible filter dict (``{"op": ..., "content": ...}``),
+        or ``None`` if ``conditions`` is empty.
+    """
     clauses = []
     for cond in conditions:
         if cond.get("op") == "range":
@@ -1766,6 +2096,25 @@ def _fetch_case_ids(clinical_filter=None, gene_ids=None):
     return ids
 
 def _fetch_full_cases(case_ids, fields, size=5000):
+    """Fetch detailed case data for a set of GDC case IDs.
+
+    Paginates through the GDC Cases API in pages of up to 2 000 records
+    (GDC performs better below that threshold) until all cases are retrieved.
+
+    Parameters
+    ----------
+    case_ids : set[str]
+        GDC case IDs to retrieve.
+    fields : list[str]
+        GDC API field paths to include in the response (dot-notation).
+    size : int, optional
+        Nominal page size; capped at 2 000 per GDC recommendation (default 5 000).
+
+    Returns
+    -------
+    list[dict]
+        Raw GDC hit dicts for all requested cases across all pages.
+    """
     # Always request "id" so we have a dedup key even if "case_id" is not returned.
     field_set = list(dict.fromkeys(["id", "case_id"] + list(fields)))
     all_hits  = []
@@ -2160,6 +2509,21 @@ def _make_cluster_card(c_id, features):
     return card, toggles, selects
 
 def _on_load_cluster_filters(event):
+    """Load per-cluster filter cards into the Query Builder from the clustering results.
+
+    Seeds the export-field selector with all matched GDC fields, then builds
+    one filter card per cluster using ``_make_cluster_card``.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+
+    Side Effects
+    ------------
+    Clears and repopulates ``_qb_clusters_col`` and ``_qb_cluster_widgets``,
+    updates ``_qb_export_choice``, and makes ``_qb_run_all_btn`` visible.
+    """
     cdf = state.get("cluster_defining_features")
     mr  = state.get("mapping_results")
     if not cdf:
@@ -2207,6 +2571,18 @@ def _on_load_cluster_filters(event):
 _qb_load_btn.on_click(_on_load_cluster_filters)
 
 def _on_run_all(event):
+    """Run GDC queries for all clusters and display a combined summary table.
+
+    Parameters
+    ----------
+    event : panel.io.model.Event
+        The button click event.
+
+    Side Effects
+    ------------
+    Populates ``state['query_results']`` with one DataFrame per cluster and
+    updates ``_qb_results_col`` with the summary returned by ``_build_qb_summary``.
+    """
     _qb_run_status.object = "*⏳ Running all cluster queries…*"
     ef = _qb_export_choice.value or DEFAULT_EXPORT_FIELDS
     logs_all = []
